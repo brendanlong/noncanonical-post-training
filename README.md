@@ -9,6 +9,11 @@ checkpoints of OLMo-3-7B-RL-Zero-Math, and the Tulu-3-8B ladder, with
 follow-ups on event clustering and on what a non-canonical span does to
 the model's later computation.
 
+The state of this repository submitted with the application to Neel Nanda's
+MATS stream (Fall 2026) is tagged
+[`mats-fall-2026-application`](https://github.com/brendanlong/noncanonical-post-training/tree/mats-fall-2026-application).
+Everything after that tag is follow-up work.
+
 - [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md): design, models and why, prompt
   sets, metrics, run order, and pre-registered predictions.
 - [RESULTS.md](RESULTS.md): one entry per run, in order, with the exact
