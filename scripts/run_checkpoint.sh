@@ -17,7 +17,7 @@ HF_DATASET="${HF_DATASET:-brendanlong/noncanonical-post-training}"
 
 upload() { uv run python -m noncanon.upload "out/$RUN_NAME" "$RUN_NAME" --repo "$HF_DATASET"; }
 
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv || true
 uv run python -m noncanon.gpu_check
 echo ">>> checkpoint $MODEL @ $REVISION -> $RUN_NAME"
 for entry in $PROMPTS; do

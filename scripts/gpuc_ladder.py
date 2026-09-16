@@ -37,7 +37,7 @@ estimated_runtime_min: {est}
 max_runtime_min: {cap}
 low_util:
   enabled: true
-  window_min: 45
+  window_min: 90   # main also holds the CPU-only metrics tail and final upload
   floor_pct: 5
   grace_min: 20
 cleanup: on_success
@@ -52,7 +52,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("gpuc"))
     args = ap.parse_args()
     model, est, cap = FAMILIES[args.family]
-    args.out.mkdir(exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     for step in args.steps:
         run_name = f"{args.family}-step{step}"
         path = args.out / f"{run_name}.yaml"
