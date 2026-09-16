@@ -44,6 +44,8 @@ noncanon/
   tests/         CPU tests on the real OLMo-3 tokenizer
 prompts/         generated prompt files and the DAPO filter report (committed)
 scripts/         recompute every cell's metrics; run every comparison; check_results.py verifies the generated tables in RESULTS.md
+                 run_checkpoint.sh generates, measures and uploads one checkpoint (the body of skypilot/run.yaml) for gpuc jobs;
+                 gpuc_ladder.py writes one gpuc job spec per intermediate RL checkpoint
                  figures.py renders figures/ from the metrics under out/ (numbers to figures/data.json): stages, RL-Zero steps,
                  span rank, divergence, recommended settings, DAPO vs AIME, correct vs incorrect, parsed vs unparsed;
                  random_examples.py and flag_composition.py print the uniformly sampled spans and the flagged-fraction decomposition
