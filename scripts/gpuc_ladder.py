@@ -6,7 +6,7 @@
 
 The model download runs in the setup phase, which the idle-GPU watchdog does
 not observe; the job itself is scripts/run_checkpoint.sh. Runtime estimates
-are for one A40 (about 150-200 output tokens/s on 7B at long contexts).
+are for one A40 (about 300 output tokens/s averaged over a cell).
 """
 
 import argparse
@@ -35,6 +35,11 @@ secrets: [HF_TOKEN]
 priority: {priority}
 estimated_runtime_min: {est}
 max_runtime_min: {cap}
+# vLLM's progress bar, from the job log: prompts finished, which runs ahead of
+# wall-clock since the long rollouts finish last.
+progress_command: >-
+  tr '\\r' '\\n' < "$GPUC_JOB_DIR/log.txt" | grep -o 'Processed prompts: *[0-9]*%' | tail -1 | grep -o '[0-9]*%'
+progress_interval_s: 120
 low_util:
   enabled: true
   window_min: 90   # main also holds the CPU-only metrics tail and final upload
