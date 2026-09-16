@@ -15,7 +15,15 @@ ARMS="${ARMS:-untruncated}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 HF_DATASET="${HF_DATASET:-brendanlong/noncanonical-post-training}"
 
-upload() { uv run python -m noncanon.upload "out/$RUN_NAME" "$RUN_NAME" --repo "$HF_DATASET"; }
+upload() {
+  local i
+  for i in 1 2 3 4 5; do
+    uv run python -m noncanon.upload "out/$RUN_NAME" "$RUN_NAME" --repo "$HF_DATASET" && return 0
+    echo ">>> upload attempt $i failed; retrying in $((i * 120))s"
+    sleep $((i * 120))
+  done
+  return 1
+}
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv || true
 # gpuc assigns cards by UUID in CUDA_VISIBLE_DEVICES; vLLM 0.11 only parses integer indices.
