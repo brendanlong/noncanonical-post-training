@@ -18,6 +18,15 @@ HF_DATASET="${HF_DATASET:-brendanlong/noncanonical-post-training}"
 upload() { uv run python -m noncanon.upload "out/$RUN_NAME" "$RUN_NAME" --repo "$HF_DATASET"; }
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv || true
+# gpuc assigns cards by UUID in CUDA_VISIBLE_DEVICES; vLLM 0.11 only parses integer indices.
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == *GPU-* ]]; then
+  CUDA_VISIBLE_DEVICES=$(for u in ${CUDA_VISIBLE_DEVICES//,/ }; do
+    nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v u="$u" '$2 == u { print $1 }'
+  done | paste -sd,)
+  export CUDA_VISIBLE_DEVICES
+  echo ">>> CUDA_VISIBLE_DEVICES mapped to indices: $CUDA_VISIBLE_DEVICES"
+  [ -n "$CUDA_VISIBLE_DEVICES" ] || { echo ">>> could not map GPU UUIDs to indices"; exit 1; }
+fi
 uv run python -m noncanon.gpu_check
 echo ">>> checkpoint $MODEL @ $REVISION -> $RUN_NAME"
 for entry in $PROMPTS; do
