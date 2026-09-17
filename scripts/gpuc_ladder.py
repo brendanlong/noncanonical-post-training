@@ -12,9 +12,11 @@ are for one A40 (about 300 output tokens/s averaged over a cell).
 import argparse
 from pathlib import Path
 
+# (model, estimated_runtime_min, max_runtime_min); the estimates are measured
+# A40 cell times (Think 4.9-6.4 h, Instruct 1.5 h).
 FAMILIES = {
-    "think": ("allenai/Olmo-3-7B-Think", 480, 1440),
-    "instruct": ("allenai/Olmo-3-7B-Instruct", 150, 600),
+    "think": ("allenai/Olmo-3-7B-Think", 390, 1440),
+    "instruct": ("allenai/Olmo-3-7B-Instruct", 100, 600),
 }
 
 SPEC = """\
@@ -33,6 +35,9 @@ env:
   RUN_NAME: {run_name}
 secrets: [HF_TOKEN]
 priority: {priority}
+# Yield the cards to anything more important; the job is queued again from the
+# start, so it only ever loses the attempt in flight.
+auto_preempt: true
 estimated_runtime_min: {est}
 max_runtime_min: {cap}
 # vLLM's progress bar, from the job log: prompts finished, which runs ahead of
