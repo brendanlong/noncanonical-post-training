@@ -35,9 +35,16 @@ from noncanon.records import write_records
 # top_p 0.95, the setting the OLMo 3 report evaluated with,
 # https://arxiv.org/html/2512.13961v2#S4.SS1.SSS1; Tulu-3: 0.6 / 0.9), so it
 # is resolved per model at run time and recorded in the meta file.
+# "standard" is a fixed setting every checkpoint can be run at, which
+# "recommended" is not: the intermediate RL revisions and the RL-Zero
+# checkpoints ship a generation_config.json with no temperature or top_p at
+# all. The values are OLMo-3's own recommendation, so the OLMo-3 endpoints'
+# existing "recommended" cells are already at exactly this setting.
 ARMS = {
     "recommended": None,
     "untruncated": {"temperature": 1.0, "top_p": 1.0},
+    "standard": {"temperature": 0.6, "top_p": 0.95},
+    "truncated": {"temperature": 1.0, "top_p": 0.95},
 }
 
 
