@@ -234,6 +234,12 @@ truncated rollouts are reported as their own category.
    on chat prompts; then the RL-Zero models and extension families as
    time allows.
 
+   *Done 2026-09-17 for both OLMo-3 tracks, at every intermediate revision
+   the Hub carries rather than the three suggested here: Think `step_0125`
+   to `step_1375` (six) and Instruct `step_050` to `step_400` (eight). See
+   RESULTS.md "RL midpoints". Think on chat prompts was not run (the chat
+   prompt set was never built).*
+
 Checkpoints are independent, so wall-clock is reduced by running several
 single-GPU boxes over checkpoint slices rather than by using a larger
 card. Each checkpoint's records are uploaded as it completes.
