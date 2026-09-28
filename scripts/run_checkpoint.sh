@@ -26,7 +26,8 @@ upload() {
 }
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv || true
-# gpuc assigns cards by UUID in CUDA_VISIBLE_DEVICES; vLLM 0.11 only parses integer indices.
+# vLLM 0.11 only parses integer indices. gpuc now passes indices itself, but
+# falls back to UUIDs when it cannot read the index table.
 if [[ "${CUDA_VISIBLE_DEVICES:-}" == *GPU-* ]]; then
   CUDA_VISIBLE_DEVICES=$(for u in ${CUDA_VISIBLE_DEVICES//,/ }; do
     nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v u="$u" '$2 == u { print $1 }'

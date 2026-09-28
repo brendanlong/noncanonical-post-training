@@ -25,9 +25,7 @@ FAMILIES = {
 
 SPEC = """\
 name: nc-{run_name}
-setup: >-
-  uv sync --frozen --extra gpu &&
-  uv run --no-sync python -c "from huggingface_hub import snapshot_download; snapshot_download('{model}', revision='{revision}')"
+setup: uv sync --frozen --extra gpu && uv run --no-sync hf download {model} --revision {revision}
 command: bash scripts/run_checkpoint.sh
 gpus: 1
 env:
