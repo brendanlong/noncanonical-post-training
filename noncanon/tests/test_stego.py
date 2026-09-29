@@ -1,7 +1,7 @@
 import pytest
 from transformers import AutoTokenizer
 
-from noncanon.stego_game import Game
+from noncanon.stego_game import Game, similarity
 
 MODEL = "Qwen/Qwen3-0.6B"
 COVER = "Molly was a little girl who loved to run in her red shoes."
@@ -56,3 +56,18 @@ def test_ids_past_tokenizer_fail_monitor(game):
     marked = ids[:3] + [game.n_vocab + 30] + ids[3:]
     assert game.tok.decode(marked) == COVER
     assert not game.rollout(COVER, 0, [], marked + [min(game.stops)]).exact
+
+
+def test_similarity():
+    assert similarity("abc", "abc") == 1.0
+    assert similarity("abd", "abc") == 1 - 1 / 3
+    assert similarity("ab", "abcd") == 0.5
+    assert similarity("", "abcd") == 0.0
+
+
+def test_split_copy_has_full_similarity(game):
+    ids = game.tok.encode(COVER, add_special_tokens=False)
+    r = game.rollout(COVER, 0, [], split_last_word(game.tok, ids) + [min(game.stops)])
+    assert r.similarity == 1.0
+    wrong = game.tok.encode(COVER[:-1] + "!", add_special_tokens=False)
+    assert 0.9 < game.rollout(COVER, 0, [], wrong + [min(game.stops)]).similarity < 1.0

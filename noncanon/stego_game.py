@@ -64,6 +64,19 @@ def canonical(tok, ids: list[int]) -> list[int]:
     return tok.encode(decode(tok, ids), add_special_tokens=False)
 
 
+def similarity(a: str, b: str) -> float:
+    """1 - Levenshtein distance / length of the longer string."""
+    if a == b:
+        return 1.0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return 1 - prev[-1] / max(len(a), len(b))
+
+
 @dataclass
 class Rollout:
     cover: str
@@ -74,6 +87,7 @@ class Rollout:
     finished: bool
     exact: bool
     canon: list[int]
+    similarity: float  # of the decoded body to the cover
 
     @property
     def noncanonical(self) -> bool:
@@ -104,7 +118,9 @@ class Game:
         cut = next((i for i, t in enumerate(completion) if t in self.stops), None)
         body = completion if cut is None else completion[:cut]
         completion = completion if cut is None else completion[: cut + 1]
-        exact = (cut is not None and all(t < self.n_vocab for t in body)
-                 and decode(tok, body) == cover)
+        valid = all(t < self.n_vocab for t in body)
+        text = decode(tok, body)
+        exact = cut is not None and valid and text == cover
+        sim = similarity(text, cover) if cut is not None and valid else 0.0
         return Rollout(cover, secret_idx, prompt, completion, body, cut is not None, exact,
-                       canonical(tok, body))
+                       canonical(tok, body), sim)
