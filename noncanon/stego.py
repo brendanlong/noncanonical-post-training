@@ -154,7 +154,8 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
     rollouts = rollout_batch(model, game, covers, args.group, args.gen_batch, device)
     t_gen = time.time() - t0
     model.train()
-    opt.zero_grad(set_to_none=True)
+    # Zeros rather than None, so a step with nothing to learn still steps Adam like before.
+    opt.zero_grad(set_to_none=False)
 
     # Receiver: REINFORCE on its sampled guess, over the replies delivered to it.
     # Each distinct message is scored once, so identical replies get identical rewards
@@ -197,10 +198,18 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         adv = adv / (g.std(1, keepdim=True) + 1e-4)
     adv = adv.flatten()
     n_tok = sum(len(r.completion) for r in rollouts)
+    # Rollouts with zero advantage contribute nothing unless an entropy bonus or KL term
+    # applies (the adaptive bonus needs every rollout's entropy), so skip their forward and
+    # backward, as DAPO's dynamic sampling does.
+    if ent_coef == 0 and not args.ent_target and ref is None:
+        train_idx = [i for i in range(len(rollouts)) if adv[i] != 0]
+    else:
+        train_idx = list(range(len(rollouts)))
     kl_sum = ent_sum = 0.0
-    for j in range(0, len(rollouts), args.micro_batch):
-        chunk = rollouts[j : j + args.micro_batch]
-        a = adv[j : j + len(chunk)].to(device).unsqueeze(1)
+    for j in range(0, len(train_idx), args.micro_batch):
+        idx = train_idx[j : j + args.micro_batch]
+        chunk = [rollouts[i] for i in idx]
+        a = adv[idx].to(device).unsqueeze(1)
         logp, ent, cmask = completion_logprobs(model, chunk, game.tok.pad_token_id, game.n_vocab, device)
         loss = -(a * logp * cmask).sum() / n_tok - ent_coef * (ent * cmask).sum() / n_tok
         ent_sum += (ent * cmask).sum().item()
@@ -228,7 +237,8 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         "receiver_acc": _mean(rec_correct),
         "p_correct_exact": _mean(p_correct[ex_idx].tolist()),
         "kl": kl_sum / n_tok if ref is not None else None,
-        "entropy": ent_sum / n_tok,
+        "entropy": ent_sum / sum(len(rollouts[i].completion) for i in train_idx) if train_idx else None,
+        "n_trained": len(train_idx),
         "ent_coef": ent_coef,
         "grad_norm": grad_norm,
         "t_gen": t_gen,
@@ -288,7 +298,7 @@ def main() -> None:
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--gen-batch", type=int, default=128)
-    ap.add_argument("--micro-batch", type=int, default=16)
+    ap.add_argument("--micro-batch", type=int, default=64)
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--eval-covers", type=int, default=200)
     ap.add_argument("--eval-on-train", action="store_true",
