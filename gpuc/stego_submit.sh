@@ -16,6 +16,7 @@ env:
   REQUIRE_CUDA: "1"
   PYTHONUNBUFFERED: "1"
   OMP_NUM_THREADS: "8"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, HF_TOKEN]
 outputs:
   - path: results
