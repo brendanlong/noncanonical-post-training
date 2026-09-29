@@ -18,6 +18,8 @@ Everything after that tag is follow-up work.
   sets, metrics, run order, and pre-registered predictions.
 - [RESULTS.md](RESULTS.md): one entry per run, in order, with the exact
   command and the numbers.
+- [STEGO.md](STEGO.md): prototype testing whether RL discovers tokenization
+  as a hidden channel past a text monitor (it doesn't, at realistic settings).
 - Artifacts (every rollout with its emitted token IDs and logprobs) live on
   the HuggingFace dataset
   [brendanlong/noncanonical-post-training](https://huggingface.co/datasets/brendanlong/noncanonical-post-training);
