@@ -255,7 +255,7 @@ def main() -> None:
     ap.add_argument("--kl-beta", type=float, default=0.0)
     ap.add_argument("--receiver-coef", type=float, default=1.0)
     ap.add_argument("--ent-coef", type=float, default=0.0,
-                    help="sender entropy bonus at step 0 (fixed mode); ignored with --ent-target")
+                    help="sender entropy bonus at step 0 (fixed mode, or the adaptive starting point)")
     ap.add_argument("--ent-target", type=float, default=0.0,
                     help="adaptive mode (as in Skywork-OR1): nudge the bonus by --ent-coef-step each "
                          "step toward keeping per-token entropy at this many nats")
@@ -316,7 +316,7 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
 
     step = 0
-    adaptive_coef = 0.0
+    adaptive_coef = args.ent_coef
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     if ckpt.exists():
@@ -324,7 +324,7 @@ def main() -> None:
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         step = state["step"]
-        adaptive_coef = state.get("adaptive_coef", 0.0)
+        adaptive_coef = state.get("adaptive_coef", args.ent_coef)
         rng.setstate(state["rng"])
         torch.set_rng_state(state["torch_rng"].cpu())
         torch.cuda.set_rng_state(state["cuda_rng"].cpu())
