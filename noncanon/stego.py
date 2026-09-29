@@ -83,7 +83,7 @@ def receiver_logits(model, pre, post, msgs: list[list[int]], answer_ids, pad, de
     return logits[:, answer_ids].float()
 
 
-def completion_logprobs(model, rollouts: list[Rollout], pad, n_vocab, device):
+def completion_logprobs(model, rollouts: list[Rollout], pad, n_vocab, device, entropy: bool = True):
     """Per completion token, right-aligned (n, max_len): log-probability, entropy of the
     distribution it was sampled from (IDs past the tokenizer masked, as in generate),
     and the mask."""
@@ -96,11 +96,11 @@ def completion_logprobs(model, rollouts: list[Rollout], pad, n_vocab, device):
     logp_all = F.log_softmax(logits, -1)
     targets = ids[:, -k:]
     logp = torch.gather(logp_all, 2, targets.unsqueeze(-1)).squeeze(-1)
-    entropy = -(logp_all.exp() * logp_all).sum(-1)
+    ent = -(logp_all.exp() * logp_all).sum(-1) if entropy else torch.zeros_like(logp)
     cmask = torch.zeros_like(logp)
     for i, r in enumerate(rollouts):
         cmask[i, k - len(r.completion):] = 1
-    return logp, entropy, cmask
+    return logp, ent, cmask
 
 
 def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, device):
@@ -210,12 +210,14 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         idx = train_idx[j : j + args.micro_batch]
         chunk = [rollouts[i] for i in idx]
         a = adv[idx].to(device).unsqueeze(1)
-        logp, ent, cmask = completion_logprobs(model, chunk, game.tok.pad_token_id, game.n_vocab, device)
+        logp, ent, cmask = completion_logprobs(model, chunk, game.tok.pad_token_id, game.n_vocab, device,
+                                               entropy=bool(ent_coef or args.ent_target))
         loss = -(a * logp * cmask).sum() / n_tok - ent_coef * (ent * cmask).sum() / n_tok
         ent_sum += (ent * cmask).sum().item()
         if ref is not None:
             with torch.no_grad():
-                ref_logp, _, _ = completion_logprobs(ref, chunk, game.tok.pad_token_id, game.n_vocab, device)
+                ref_logp, _, _ = completion_logprobs(ref, chunk, game.tok.pad_token_id, game.n_vocab, device,
+                                                     entropy=False)
             d = ref_logp - logp
             kl = (d.exp() - d - 1) * cmask
             loss = loss + args.kl_beta * kl.sum() / n_tok
@@ -237,7 +239,8 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         "receiver_acc": _mean(rec_correct),
         "p_correct_exact": _mean(p_correct[ex_idx].tolist()),
         "kl": kl_sum / n_tok if ref is not None else None,
-        "entropy": ent_sum / sum(len(rollouts[i].completion) for i in train_idx) if train_idx else None,
+        "entropy": (ent_sum / sum(len(rollouts[i].completion) for i in train_idx)
+                    if train_idx and (ent_coef or args.ent_target) else None),
         "n_trained": len(train_idx),
         "ent_coef": ent_coef,
         "grad_norm": grad_norm,
@@ -298,7 +301,7 @@ def main() -> None:
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--gen-batch", type=int, default=128)
-    ap.add_argument("--micro-batch", type=int, default=64)
+    ap.add_argument("--micro-batch", type=int, default=32)
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--eval-covers", type=int, default=200)
     ap.add_argument("--eval-on-train", action="store_true",
