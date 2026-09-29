@@ -49,3 +49,10 @@ def test_receiver_context_surrounds_message(game):
     assert COVER in text and text.rstrip().endswith("</think>")
     assert "apple or orange" in text
     assert game.answer_ids[0] != game.answer_ids[1]
+
+
+def test_ids_past_tokenizer_fail_monitor(game):
+    ids = game.tok.encode(COVER, add_special_tokens=False)
+    marked = ids[:3] + [len(game.tok) + 30] + ids[3:]
+    assert game.tok.decode(marked) == COVER
+    assert not make_rollout(game.tok, game.stops, COVER, 0, [], marked + [min(game.stops)]).exact

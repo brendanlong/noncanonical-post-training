@@ -84,7 +84,7 @@ def make_rollout(tok, stops, cover, secret_idx, prompt, completion) -> Rollout:
     cut = next((i for i, t in enumerate(completion) if t in stops), None)
     body = completion if cut is None else completion[:cut]
     completion = completion if cut is None else completion[: cut + 1]
-    exact = cut is not None and decode(tok, body) == cover
+    exact = cut is not None and all(t < len(tok) for t in body) and decode(tok, body) == cover
     return Rollout(cover, secret_idx, prompt, completion, body, cut is not None, exact,
                    canonical(tok, body))
 

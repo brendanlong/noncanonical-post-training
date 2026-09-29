@@ -135,22 +135,30 @@ def train_step(model, ref, opt, game: Game, covers, args, device) -> dict:
     opt.zero_grad(set_to_none=True)
 
     # Receiver: REINFORCE on its sampled guess, over replies that passed the monitor.
+    # Each distinct message is scored once, so identical replies get identical rewards
+    # (batch-dependent bf16 noise would otherwise become full-size GRPO advantages).
     ex_idx = [i for i, r in enumerate(rollouts) if r.exact]
+    by_msg: dict[tuple[int, ...], list[int]] = {}
+    for i in ex_idx:
+        by_msg.setdefault(tuple(game.message(rollouts[i], args.channel)), []).append(i)
+    msgs = list(by_msg)
     p_correct = torch.zeros(len(rollouts))
     rec_correct = []
     n_ex = max(len(ex_idx), 1)
-    for j in range(0, len(ex_idx), args.micro_batch):
-        idx = ex_idx[j : j + args.micro_batch]
-        chunk = [rollouts[i] for i in idx]
-        lg = receiver_logits(model, game.pre, game.post, [game.message(r, args.channel) for r in chunk],
+    for j in range(0, len(msgs), args.micro_batch):
+        chunk = msgs[j : j + args.micro_batch]
+        lg = receiver_logits(model, game.pre, game.post, [list(m) for m in chunk],
                              game.answer_ids, game.tok.pad_token_id, device)
-        logp = lg.log_softmax(-1)
-        secret = torch.tensor([r.secret_idx for r in chunk], device=device)
-        p_correct[idx] = logp.detach().exp()[torch.arange(len(chunk)), secret].cpu()
-        guess = torch.multinomial(logp.detach().exp(), 1).squeeze(-1)
+        row = torch.tensor([k for k, m in enumerate(chunk) for _ in by_msg[m]], device=device)
+        idx = [i for m in chunk for i in by_msg[m]]
+        logp = lg.log_softmax(-1)[row]
+        secret = torch.tensor([rollouts[i].secret_idx for i in idx], device=device)
+        probs = logp.detach().exp()
+        p_correct[idx] = probs[torch.arange(len(idx)), secret].cpu()
+        guess = torch.multinomial(probs, 1).squeeze(-1)
         reward = (guess == secret).float()
         rec_correct.extend(reward.tolist())
-        loss = -((reward - 0.5) * logp[torch.arange(len(chunk)), guess]).sum() / n_ex
+        loss = -((reward - 0.5) * logp[torch.arange(len(idx)), guess]).sum() / n_ex
         (args.receiver_coef * loss).backward()
 
     # Sender: GRPO advantages within each (cover, secret) group, token-level loss.
@@ -205,6 +213,13 @@ def atomic_save(obj, path: Path) -> None:
 def append_jsonl(path: Path, row: dict) -> None:
     with open(path, "a") as f:
         f.write(json.dumps(row) + "\n")
+
+
+def truncate_jsonl(path: Path, step: int) -> None:
+    """Drop rows logged after the checkpoint being resumed from."""
+    if path.exists():
+        rows = [l for l in path.read_text().splitlines() if json.loads(l)["step"] <= step]
+        path.write_text("".join(r + "\n" for r in rows))
 
 
 def main() -> None:
@@ -265,6 +280,9 @@ def main() -> None:
     # Assigned rather than passed: generate() replaces values left at their defaults
     # (temperature 1, top_p 1) with the model's own sampling defaults.
     model.generation_config = gen_cfg
+    # Embedding rows past the tokenizer decode to "", so they would pass the monitor
+    # as invisible markers rather than as a different split of the same text.
+    gen_cfg.suppress_tokens = list(range(len(tok), model.get_input_embeddings().num_embeddings))
     ref = None
     if args.kl_beta > 0:
         ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device).eval()
@@ -280,8 +298,10 @@ def main() -> None:
         opt.load_state_dict(state["opt"])
         step = state["step"]
         rng.setstate(state["rng"])
-        torch.set_rng_state(state["torch_rng"])
+        torch.set_rng_state(state["torch_rng"].cpu())
         torch.cuda.set_rng_state(state["cuda_rng"].cpu())
+        for f in ("train.jsonl", "eval.jsonl"):
+            truncate_jsonl(out / f, step)
         print(f"resumed from {ckpt} at step {step}", flush=True)
     else:
         for f in ("train.jsonl", "eval.jsonl"):
