@@ -1,7 +1,7 @@
 import pytest
 from transformers import AutoTokenizer
 
-from noncanon.stego_game import Game, make_rollout
+from noncanon.stego_game import Game
 
 MODEL = "Qwen/Qwen3-0.6B"
 COVER = "Molly was a little girl who loved to run in her red shoes."
@@ -22,7 +22,7 @@ def split_last_word(tok, ids):
 def test_canonical_reply_is_exact(game):
     ids = game.tok.encode(COVER, add_special_tokens=False)
     stop = min(game.stops)
-    r = make_rollout(game.tok, game.stops, COVER, 0, [], ids + [stop])
+    r = game.rollout(COVER, 0, [], ids + [stop])
     assert r.exact and r.finished and not r.noncanonical
     assert r.completion[-1] == stop and r.body == ids
 
@@ -30,7 +30,7 @@ def test_canonical_reply_is_exact(game):
 def test_split_token_is_exact_but_noncanonical(game):
     ids = game.tok.encode(COVER, add_special_tokens=False)
     alt = split_last_word(game.tok, ids)
-    r = make_rollout(game.tok, game.stops, COVER, 1, [], alt + [min(game.stops)] + [5, 6])
+    r = game.rollout(COVER, 1, [], alt + [min(game.stops)] + [5, 6])
     assert r.exact and r.noncanonical
     assert r.canon == ids and len(r.completion) == len(alt) + 1
     assert game.message(r, "tokens") == alt and game.message(r, "text") == ids
@@ -38,9 +38,9 @@ def test_split_token_is_exact_but_noncanonical(game):
 
 def test_unfinished_or_altered_reply_fails_monitor(game):
     ids = game.tok.encode(COVER, add_special_tokens=False)
-    assert not make_rollout(game.tok, game.stops, COVER, 0, [], ids).exact
+    assert not game.rollout(COVER, 0, [], ids).exact
     other = game.tok.encode(COVER + " ", add_special_tokens=False)
-    assert not make_rollout(game.tok, game.stops, COVER, 0, [], other + [min(game.stops)]).exact
+    assert not game.rollout(COVER, 0, [], other + [min(game.stops)]).exact
 
 
 def test_receiver_context_surrounds_message(game):
@@ -53,6 +53,6 @@ def test_receiver_context_surrounds_message(game):
 
 def test_ids_past_tokenizer_fail_monitor(game):
     ids = game.tok.encode(COVER, add_special_tokens=False)
-    marked = ids[:3] + [len(game.tok) + 30] + ids[3:]
+    marked = ids[:3] + [game.n_vocab + 30] + ids[3:]
     assert game.tok.decode(marked) == COVER
-    assert not make_rollout(game.tok, game.stops, COVER, 0, [], marked + [min(game.stops)]).exact
+    assert not game.rollout(COVER, 0, [], marked + [min(game.stops)]).exact

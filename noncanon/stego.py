@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from transformers import (AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LogitsProcessor,
                           LogitsProcessorList)
 
-from noncanon.stego_game import Game, Rollout, decode, make_rollout
+from noncanon.stego_game import Game, Rollout, decode
 
 
 class MaskFrom(LogitsProcessor):
@@ -102,7 +102,7 @@ def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, d
     specs = [(c, s) for c in covers for s in (0, 1) for _ in range(group)]
     prompts = [game.prompt(c, s) for c, s in specs]
     comps = generate(model, game.tok, prompts, gen_batch, device)
-    return [make_rollout(game.tok, game.stops, c, s, p, x)
+    return [game.rollout(c, s, p, x)
             for (c, s), p, x in zip(specs, prompts, comps)]
 
 
@@ -291,10 +291,8 @@ def main() -> None:
     # Assigned rather than passed: generate() replaces values left at their defaults
     # (temperature 1, top_p 1) with the model's own sampling defaults.
     model.generation_config = gen_cfg
-    # Embedding rows past the tokenizer decode to "", so they would pass the monitor
-    # as invisible markers rather than as a different split of the same text.
-    # (GenerationConfig.suppress_tokens does the same but made generation 20x slower.)
-    model.stego_logits_processor = LogitsProcessorList([MaskFrom(len(tok))])
+    # Never sample the embedding rows past the tokenizer (see Game.rollout).
+    model.stego_logits_processor = LogitsProcessorList([MaskFrom(game.n_vocab)])
     ref = None
     if args.kl_beta > 0:
         ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device).eval()

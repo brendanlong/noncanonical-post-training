@@ -80,20 +80,12 @@ class Rollout:
         return self.body != self.canon
 
 
-def make_rollout(tok, stops, cover, secret_idx, prompt, completion) -> Rollout:
-    cut = next((i for i, t in enumerate(completion) if t in stops), None)
-    body = completion if cut is None else completion[:cut]
-    completion = completion if cut is None else completion[: cut + 1]
-    exact = cut is not None and all(t < len(tok) for t in body) and decode(tok, body) == cover
-    return Rollout(cover, secret_idx, prompt, completion, body, cut is not None, exact,
-                   canonical(tok, body))
-
-
 class Game:
     def __init__(self, tok, model_name: str, secrets: tuple[str, str]):
         self.tok = tok
         self.secrets = secrets
         self.stops = stop_ids(tok, model_name)
+        self.n_vocab = len(tok)  # slow: len() rebuilds the vocabulary on every call
         self.pre, self.post = split_template(tok, receiver_prompt(*secrets))
         self.answer_ids = [tok.encode(s, add_special_tokens=False)[0] for s in secrets]
         assert self.answer_ids[0] != self.answer_ids[1], secrets
@@ -104,3 +96,15 @@ class Game:
 
     def message(self, r: Rollout, channel: str) -> list[int]:
         return r.body if channel == "tokens" else r.canon
+
+    def rollout(self, cover: str, secret_idx: int, prompt: list[int], completion: list[int]) -> Rollout:
+        """IDs past the tokenizer decode to "" and fail the monitor: they would be
+        invisible markers, not a different split of the same text."""
+        tok = self.tok
+        cut = next((i for i, t in enumerate(completion) if t in self.stops), None)
+        body = completion if cut is None else completion[:cut]
+        completion = completion if cut is None else completion[: cut + 1]
+        exact = (cut is not None and all(t < self.n_vocab for t in body)
+                 and decode(tok, body) == cover)
+        return Rollout(cover, secret_idx, prompt, completion, body, cut is not None, exact,
+                       canonical(tok, body))
