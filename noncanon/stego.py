@@ -254,9 +254,15 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--kl-beta", type=float, default=0.0)
     ap.add_argument("--receiver-coef", type=float, default=1.0)
-    ap.add_argument("--ent-coef", type=float, default=0.0, help="sender entropy bonus at step 0")
+    ap.add_argument("--ent-coef", type=float, default=0.0,
+                    help="sender entropy bonus at step 0 (fixed mode); ignored with --ent-target")
+    ap.add_argument("--ent-target", type=float, default=0.0,
+                    help="adaptive mode (as in Skywork-OR1): nudge the bonus by --ent-coef-step each "
+                         "step toward keeping per-token entropy at this many nats")
+    ap.add_argument("--ent-coef-step", type=float, default=0.005)
+    ap.add_argument("--ent-coef-max", type=float, default=0.3)
     ap.add_argument("--ent-anneal-steps", type=int, default=0,
-                    help="decay the entropy bonus linearly to 0 by this step (0: constant)")
+                    help="decay the bonus (fixed mode) or the target (adaptive) linearly to 0 by this step")
     ap.add_argument("--no-std-norm", action="store_true", help="Dr. GRPO: advantages not divided by group std")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -310,6 +316,7 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
 
     step = 0
+    adaptive_coef = 0.0
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     if ckpt.exists():
@@ -317,6 +324,7 @@ def main() -> None:
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         step = state["step"]
+        adaptive_coef = state.get("adaptive_coef", 0.0)
         rng.setstate(state["rng"])
         torch.set_rng_state(state["torch_rng"].cpu())
         torch.cuda.set_rng_state(state["cuda_rng"].cpu())
@@ -339,8 +347,13 @@ def main() -> None:
         run_eval(0)
     while step < args.steps:
         covers_now = rng.sample(train_covers, min(args.covers_per_step, len(train_covers)))
-        ent_coef = args.ent_coef * (max(0.0, 1 - step / args.ent_anneal_steps) if args.ent_anneal_steps else 1.0)
+        decay = max(0.0, 1 - step / args.ent_anneal_steps) if args.ent_anneal_steps else 1.0
+        ent_coef = adaptive_coef if args.ent_target else args.ent_coef * decay
         stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device)
+        if args.ent_target:
+            stats["ent_target"] = target = args.ent_target * decay
+            nudge = args.ent_coef_step if stats["entropy"] < target else -args.ent_coef_step
+            adaptive_coef = min(max(adaptive_coef + nudge, 0.0), args.ent_coef_max)
         step += 1
         append_jsonl(out / "train.jsonl", {"step": step, **stats})
         if step % 10 == 0 or step == 1:
@@ -351,7 +364,7 @@ def main() -> None:
             run_eval(step)
         if step % args.save_every == 0 and step < args.steps:
             atomic_save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                         "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
+                         "adaptive_coef": adaptive_coef, "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
                          "cuda_rng": torch.cuda.get_rng_state()}, ckpt)
     if args.save_final:
         model.to(torch.bfloat16).save_pretrained(out / "final")
