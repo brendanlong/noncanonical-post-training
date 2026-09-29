@@ -8,7 +8,7 @@ expected number of places a sampled copy starts a non-canonical span.
 With ``--temperatures``, the same is done on the distribution sampled at each
 temperature, and per copy it reports P(canonical copy, then stop) = product of the
 canonical tokens' probabilities, and P(exact copy with one split) ~= sum over
-positions of P(alternative) x product of the canonical probabilities elsewhere.
+positions of P(alternative) x product of the canonical probabilities elsewhere (ending on any stop token).
 The second assumes a split word is finished correctly and the copy returns to
 canonical, which is not measured, so it is an upper bound.
 
@@ -57,7 +57,8 @@ def main() -> None:
     covers = json.loads(Path(args.covers).read_text())["eval"][: args.n]
 
     temps = [float(t) for t in args.temperatures.split(",")]
-    stop = min(game.stops)
+    stop = min(game.stops)  # any stop token will do for teacher forcing; all are scored below
+    stops = sorted(game.stops)
     rows, by_temp = [], {t: [] for t in temps}
     for i, cover in enumerate(covers):
         prompt = game.prompt(cover, i % 2)
@@ -74,6 +75,7 @@ def main() -> None:
         for temp in temps:
             probs = (logits / temp).softmax(-1)
             pc = probs[torch.arange(len(targets)), targets].double()
+            pc[-1] = probs[-1, stops].sum()
             pa = torch.tensor([probs[k, a].sum().item() if a else 0.0 for k, a in enumerate(alts)] + [0.0],
                               dtype=torch.float64, device=args.device)
             p_canon = pc.prod().item()
