@@ -306,7 +306,8 @@ def main() -> None:
     ap.add_argument("--eval-covers", type=int, default=200)
     ap.add_argument("--eval-on-train", action="store_true",
                     help="evaluate on the train covers (cycled to --eval-covers) instead of held-out ones")
-    ap.add_argument("--save-every", type=int, default=100)
+    ap.add_argument("--save-every", type=int, default=100,
+                    help="resume checkpoints (weights + Adam, about 16 bytes per parameter); 0 = none")
     ap.add_argument("--save-final", action="store_true")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--ckpt-dir", default=None, help="resume state; default <out-dir>/../ckpt-<name>")
@@ -396,7 +397,7 @@ def main() -> None:
         (out / "progress.txt").write_text(f"{step / args.steps:.4f}\n")
         if step % args.eval_every == 0 or step == args.steps:
             run_eval(step)
-        if step % args.save_every == 0 and step < args.steps:
+        if args.save_every and step % args.save_every == 0 and step < args.steps:
             atomic_save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                          "adaptive_coef": adaptive_coef, "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
                          "cuda_rng": torch.cuda.get_rng_state()}, ckpt)
