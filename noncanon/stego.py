@@ -82,20 +82,24 @@ def receiver_logits(model, pre, post, msgs: list[list[int]], answer_ids, pad, de
     return logits[:, answer_ids].float()
 
 
-def completion_logprobs(model, rollouts: list[Rollout], pad, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Log-probabilities of each completion token, right-aligned: (n, max_len) and its mask."""
+def completion_logprobs(model, rollouts: list[Rollout], pad, n_vocab, device):
+    """Per completion token, right-aligned (n, max_len): log-probability, entropy of the
+    distribution it was sampled from (IDs past the tokenizer masked, as in generate),
+    and the mask."""
     seqs = [r.prompt + r.completion for r in rollouts]
     ids, mask = left_pad(seqs, pad, device)
     k = max(len(r.completion) for r in rollouts)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         logits = model(input_ids=ids, attention_mask=mask, position_ids=positions(mask),
-                       logits_to_keep=k + 1).logits[:, :-1].float()
+                       logits_to_keep=k + 1).logits[:, :-1, :n_vocab].float()
+    logp_all = F.log_softmax(logits, -1)
     targets = ids[:, -k:]
-    logp = torch.gather(F.log_softmax(logits, -1), 2, targets.unsqueeze(-1)).squeeze(-1)
+    logp = torch.gather(logp_all, 2, targets.unsqueeze(-1)).squeeze(-1)
+    entropy = -(logp_all.exp() * logp_all).sum(-1)
     cmask = torch.zeros_like(logp)
     for i, r in enumerate(rollouts):
         cmask[i, k - len(r.completion):] = 1
-    return logp, cmask
+    return logp, entropy, cmask
 
 
 def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, device):
@@ -138,7 +142,7 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
-def train_step(model, ref, opt, game: Game, covers, args, device) -> dict:
+def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, device) -> dict:
     t0 = time.time()
     rollouts = rollout_batch(model, game, covers, args.group, args.gen_batch, device)
     t_gen = time.time() - t0
@@ -180,15 +184,16 @@ def train_step(model, ref, opt, game: Game, covers, args, device) -> dict:
         adv = adv / (g.std(1, keepdim=True) + 1e-4)
     adv = adv.flatten()
     n_tok = sum(len(r.completion) for r in rollouts)
-    kl_sum = 0.0
+    kl_sum = ent_sum = 0.0
     for j in range(0, len(rollouts), args.micro_batch):
         chunk = rollouts[j : j + args.micro_batch]
         a = adv[j : j + len(chunk)].to(device).unsqueeze(1)
-        logp, cmask = completion_logprobs(model, chunk, game.tok.pad_token_id, device)
-        loss = -(a * logp * cmask).sum() / n_tok
+        logp, ent, cmask = completion_logprobs(model, chunk, game.tok.pad_token_id, game.n_vocab, device)
+        loss = -(a * logp * cmask).sum() / n_tok - ent_coef * (ent * cmask).sum() / n_tok
+        ent_sum += (ent * cmask).sum().item()
         if ref is not None:
             with torch.no_grad():
-                ref_logp, _ = completion_logprobs(ref, chunk, game.tok.pad_token_id, device)
+                ref_logp, _, _ = completion_logprobs(ref, chunk, game.tok.pad_token_id, game.n_vocab, device)
             d = ref_logp - logp
             kl = (d.exp() - d - 1) * cmask
             loss = loss + args.kl_beta * kl.sum() / n_tok
@@ -209,6 +214,8 @@ def train_step(model, ref, opt, game: Game, covers, args, device) -> dict:
         "receiver_acc": _mean(rec_correct),
         "p_correct_exact": _mean(p_correct[ex_idx].tolist()),
         "kl": kl_sum / n_tok if ref is not None else None,
+        "entropy": ent_sum / n_tok,
+        "ent_coef": ent_coef,
         "grad_norm": grad_norm,
         "t_gen": t_gen,
         "t_step": time.time() - t0,
@@ -247,6 +254,9 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--kl-beta", type=float, default=0.0)
     ap.add_argument("--receiver-coef", type=float, default=1.0)
+    ap.add_argument("--ent-coef", type=float, default=0.0, help="sender entropy bonus at step 0")
+    ap.add_argument("--ent-anneal-steps", type=int, default=0,
+                    help="decay the entropy bonus linearly to 0 by this step (0: constant)")
     ap.add_argument("--no-std-norm", action="store_true", help="Dr. GRPO: advantages not divided by group std")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -329,7 +339,8 @@ def main() -> None:
         run_eval(0)
     while step < args.steps:
         covers_now = rng.sample(train_covers, min(args.covers_per_step, len(train_covers)))
-        stats = train_step(model, ref, opt, game, covers_now, args, device)
+        ent_coef = args.ent_coef * (max(0.0, 1 - step / args.ent_anneal_steps) if args.ent_anneal_steps else 1.0)
+        stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device)
         step += 1
         append_jsonl(out / "train.jsonl", {"step": step, **stats})
         if step % 10 == 0 or step == 1:
