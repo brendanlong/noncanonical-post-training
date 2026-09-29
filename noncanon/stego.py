@@ -31,9 +31,19 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import (AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LogitsProcessor,
+                          LogitsProcessorList)
 
 from noncanon.stego_game import Game, Rollout, decode, make_rollout
+
+
+class MaskFrom(LogitsProcessor):
+    def __init__(self, first: int):
+        self.first = first
+
+    def __call__(self, input_ids, scores):
+        scores[:, self.first:] = -float("inf")
+        return scores
 
 
 def left_pad(seqs: list[list[int]], pad: int, device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -57,7 +67,8 @@ def generate(model, tok, prompts: list[list[int]], batch: int, device) -> list[l
     for i in range(0, len(prompts), batch):
         ids, mask = left_pad(prompts[i : i + batch], tok.pad_token_id, device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            seq = model.generate(input_ids=ids, attention_mask=mask)
+            seq = model.generate(input_ids=ids, attention_mask=mask,
+                                 logits_processor=model.stego_logits_processor)
         out.extend(s[ids.shape[1]:].tolist() for s in seq)
     return out
 
@@ -282,7 +293,8 @@ def main() -> None:
     model.generation_config = gen_cfg
     # Embedding rows past the tokenizer decode to "", so they would pass the monitor
     # as invisible markers rather than as a different split of the same text.
-    gen_cfg.suppress_tokens = list(range(len(tok), model.get_input_embeddings().num_embeddings))
+    # (GenerationConfig.suppress_tokens does the same but made generation 20x slower.)
+    model.stego_logits_processor = LogitsProcessorList([MaskFrom(len(tok))])
     ref = None
     if args.kl_beta > 0:
         ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device).eval()
