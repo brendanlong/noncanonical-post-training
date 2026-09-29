@@ -1,7 +1,8 @@
 #!/bin/bash
-# Queue one noncanon.stego run on the SPAR host's owned cards, low priority and
-# preemptible (the run resumes from its checkpoint when requeued).
+# Queue one noncanon.stego run, by default on the SPAR host's owned cards, low
+# priority and preemptible (the run resumes from its checkpoint when requeued).
 #   gpuc/stego_submit.sh <run-name> [noncanon.stego args...]
+#   TARGET="--runpod --gpu A40 --max-price 1.10" gpuc/stego_submit.sh ...
 set -euo pipefail
 run=$1; shift
 spec=.tmp-gpuc/$run.yaml
@@ -27,4 +28,4 @@ estimated_runtime_min: ${EST_MIN:-240}
 progress_command: "cat results/$run/progress.txt"
 cleanup: on_success
 YAML
-gpuc submit "$spec" --host spar --json | jq -r '.job_id // .error'
+gpuc submit "$spec" ${TARGET:---host spar} --json | jq -r '.job_id // .error'
