@@ -184,7 +184,7 @@ def evaluate(model, game: Game, covers, args, device, eav=None, probes=None) -> 
         for channel in ("tokens", "text"):
             if probes is not None:
                 p = probes[0].p_correct([game.message(r, channel) for r in rs], [r.secret_idx for r in rs]).tolist() if rs else []
-                stats[f"acc_{channel}{suffix}"] = _mean([x > 0.5 for x in p])
+                stats[f"acc_{channel}{suffix}"] = _mean([(x > 0.5) + 0.5 * (x == 0.5) for x in p])
                 stats[f"p_correct_{channel}{suffix}"] = _mean(p)
                 continue
             p = []
@@ -193,12 +193,12 @@ def evaluate(model, game: Game, covers, args, device, eav=None, probes=None) -> 
                 lg = receiver_logits(model, game.pre, game.post, [game.message(r, channel) for r in chunk],
                                      game.answer_ids, game.tok.pad_token_id, device)
                 p.extend(lg.softmax(-1)[torch.arange(len(chunk)), [r.secret_idx for r in chunk]].tolist())
-            stats[f"acc_{channel}{suffix}"] = _mean([x > 0.5 for x in p])
+            stats[f"acc_{channel}{suffix}"] = _mean([(x > 0.5) + 0.5 * (x == 0.5) for x in p])
             stats[f"p_correct_{channel}{suffix}"] = _mean(p)
         stats[f"leak{suffix}"] = (stats[f"acc_tokens{suffix}"] or 0) - (stats[f"acc_text{suffix}"] or 0)
         if probes is not None and rs:
             p = probes[1].p_correct([game.message(r, "text") for r in rs], [r.secret_idx for r in rs]).tolist()
-            stats[f"acc_eavesdropper{suffix}"] = _mean([x > 0.5 for x in p])
+            stats[f"acc_eavesdropper{suffix}"] = _mean([(x > 0.5) + 0.5 * (x == 0.5) for x in p])
         if eav is not None:
             eav_model, _, eav_device = eav
             eav_model.eval()
@@ -208,7 +208,7 @@ def evaluate(model, game: Game, covers, args, device, eav=None, probes=None) -> 
                 lg = receiver_logits(eav_model, game.pre, game.post, [game.message(r, "text") for r in chunk],
                                      game.answer_ids, game.tok.pad_token_id, eav_device)
                 p.extend(lg.softmax(-1)[torch.arange(len(chunk)), [r.secret_idx for r in chunk]].tolist())
-            stats[f"acc_eavesdropper{suffix}"] = _mean([x > 0.5 for x in p])
+            stats[f"acc_eavesdropper{suffix}"] = _mean([(x > 0.5) + 0.5 * (x == 0.5) for x in p])
     tok = game.tok
     dump = [{"cover": r.cover, "secret": game.secrets[r.secret_idx], "exact": r.exact,
              "noncanonical": r.noncanonical, "body": r.body,
