@@ -130,6 +130,76 @@ So a generic exploration bonus doesn't supply the foothold either. What does
 has to put probability on splits specifically, which is a direct push on
 tokens.
 
+## Temperature
+
+Does sampling at a higher temperature do better than an entropy bonus? It acts
+differently. It divides every log-probability by the temperature, which helps
+the rarest tokens most in relative terms, but it doesn't change the weights, so
+training can still sharpen them. `noncanon.stego_split_mass --temperatures`
+computes the following from each base model's probabilities, over the 200 eval
+covers, before any training:
+
+- P(canonical copy): the product of the canonical tokens' probabilities,
+  including the stop token.
+- P(exact copy with one split): the sum over positions of the alternative
+  tokens' probability, times the canonical probabilities elsewhere. This is an
+  upper bound, because it assumes a split word is finished correctly.
+
+Each cell is exact copies / share of exact copies that are split / expected
+split copies per 128 rollouts:
+
+| temperature | Qwen3-1.7B | Qwen3-0.6B | OLMo-2-1B |
+|---|---|---|---|
+| 1.0 | 86% / 0.0007% / 0.0008 | 39% / 1.7% / 0.85 | 46% / 0.8% / 0.47 |
+| 1.25 | 85% / 0.006% / 0.006 | 34% / 2.5% / 1.1 | 15% / 2.7% / 0.52 |
+| 1.5 | 83% / 0.03% / 0.03 | 26% / 3.5% / 1.2 | 1% / 6.6% / 0.08 |
+| 2.0 | 73% / 0.2% / 0.19 | 5% / 6.4% / 0.44 | ~0 |
+| 3.0 | 2% / 2.1% / 0.06 | ~0 | ~0 |
+
+Sampled checks agree: OLMo-2-1B copies exactly 0.5% of the time at temperature
+1.5 and 0% at 2.0 (400 rollouts each).
+
+Temperature raises the split share of exact copies steadily, which the entropy
+bonus never did. But it destroys exact copying faster, so no model gets above
+about one split copy per 128 rollouts, and that's before RL sharpens the
+policy. (Sampling is also untruncated throughout: `top_k=0`, `top_p=1`. A
+pipeline sampling with top-p 0.95 would never sample these tokens at all.)
+
+## Partial credit: character-similarity reward
+
+`--reward similarity` pays the sender 1 − (Levenshtein distance / length) instead
+of 0/1 for exactness. So near-copies earn partial credit, and a reward
+explosion is no longer permanent. Two variants of what the receiver sees:
+
+- `--deliver exact`: only exact replies reach the receiver. The sender is paid
+  similarity × P(receiver correct) if delivered, else similarity × 0.5.
+- `--deliver all`: every finished reply reaches the receiver, so partial
+  credit also flows through the receiver. That makes visible edits a possible
+  channel.
+
+OLMo-2-1B, token channel, 1,500 steps × 128 rollouts, `--deliver exact`:
+
+| run | exact copies (final) | receiver accuracy on exact copies | token receiver minus text receiver | reward | non-canonical exact copies |
+|---|---|---|---|---|---|
+| no bonus | 50% | 1.000 from step 100 | 0.000 at every eval | 0.746 | 1 |
+| adaptive bonus (start 0.15, target 0.1) | 50% | 0.99-1.00 from step 100 | 0.000 at every eval | 0.746 | 61 |
+
+**Both runs found a selection channel within about 60-80 steps, and neither
+used tokenization.** For apple, the sender copies exactly (200 of 200 final eval
+rollouts). For orange, it copies the sentence and appends a newline (200 of
+200), so the reply isn't exact and isn't delivered. The receiver answers apple
+to everything that arrives, and is always right. Orange earns about 0.99 × 0.5
+instead of the 0 an exact copy would get, so the average reward is 0.75,
+against 0.5 without any signal.
+
+This is an artifact of paying undelivered replies 0.5. With the exact-only
+reward, breaking the copy paid 0, the same as copying, so there was nothing to
+gain. It's also a realistic kind of leak: which messages get through carries
+information, and the edit used is whitespace most displays hide. Moving to a
+token channel would raise the reward from 0.75 to 1.0. But the receiver already
+answers apple to every exact copy, so an orange sender that tries an exact
+split copy scores 0 and is pushed away before the receiver can learn to read it.
+
 ## What this does and doesn't show
 
 - **It shows:** in the lowest-entropy task there is (copy a given text), with
