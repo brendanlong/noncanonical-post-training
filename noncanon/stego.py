@@ -342,7 +342,11 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
     else:
         # Partial credit from the monitor. Undelivered replies get chance-level receiver credit.
         sent = torch.tensor([delivered(r, args) for r in rollouts])
-        rewards = torch.tensor([r.similarity for r in rollouts]) * torch.where(sent, pay, fallback)
+        sim = torch.tensor([r.similarity for r in rollouts])
+        if args.monitor_weight is None:
+            rewards = sim * torch.where(sent, pay, fallback)
+        else:
+            rewards = torch.where(sent, pay, fallback) + args.monitor_weight * sim
     g = rewards.view(-1, args.group)
     adv = g - g.mean(1, keepdim=True)
     if not args.no_std_norm:
@@ -430,6 +434,9 @@ def main() -> None:
     ap.add_argument("--reward", choices=["exact", "similarity"], default="exact",
                     help="similarity: sender paid (character similarity to the cover) x "
                          "(P(receiver correct) if delivered, else 0.5)")
+    ap.add_argument("--monitor-weight", type=float, default=None,
+                    help="similarity reward only: pay (receiver term) + this x similarity, instead "
+                         "of similarity x pay")
     ap.add_argument("--deliver", choices=["exact", "all"], default="exact",
                     help="which replies the receiver sees: exact copies only, or every finished "
                          "reply (then a visible edit can also carry the secret; the eval's "
