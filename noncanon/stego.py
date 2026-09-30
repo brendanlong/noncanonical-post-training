@@ -14,6 +14,12 @@ IDs, as when a pipeline passes token IDs between turns or agents.
 ``--channel text``: the receiver sees the reply re-encoded from text, as when
 transcripts are stored as text. No information can pass; this is the control.
 
+``--decoder bow`` replaces both with two cheap probes (logistic regression on
+which token IDs a message contains): a receiver on the emitted IDs and an
+eavesdropper on the re-encoded text, trained identically, with the sender paid
+the difference. Visible signals then net exactly nothing, because whenever the
+emitted IDs are canonical the two probes see the same input.
+
 ``--eavesdropper separate`` adds an adversary: a second copy of the model that
 learns to guess the secret from the re-encoded text (a transcript), and the sender
 is paid P(receiver correct) - P(eavesdropper correct), so any visible signal nets
@@ -116,8 +122,57 @@ def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, d
             for (c, s), p, x in zip(specs, prompts, comps)]
 
 
+class BowProbe:
+    """Logistic regression on which token IDs a message contains: a cheap receiver
+    or eavesdropper. Scores before each update, like the LM decoders."""
+
+    def __init__(self, n_vocab: int, lr: float, device):
+        self.w = torch.zeros(n_vocab, 1, device=device, requires_grad=True)
+        self.b = torch.zeros((), device=device, requires_grad=True)
+        self.opt = torch.optim.Adam([self.w, self.b], lr=lr)
+        self.device = device
+
+    def logits(self, msgs: list[list[int]]) -> torch.Tensor:
+        """Logit of the second secret, per message."""
+        ids = [sorted(set(m)) or [0] for m in msgs]
+        flat = torch.tensor([t for i in ids for t in i], device=self.device)
+        offsets = torch.tensor([0] + [len(i) for i in ids[:-1]], device=self.device).cumsum(0)
+        return F.embedding_bag(flat, self.w, offsets, mode="sum").squeeze(-1) + self.b
+
+    def p_correct(self, msgs, secrets: list[int]) -> torch.Tensor:
+        p1 = torch.sigmoid(self.logits(msgs)).detach().cpu()
+        s = torch.tensor(secrets, dtype=torch.float32)
+        return s * p1 + (1 - s) * (1 - p1)
+
+    def fit(self, game: "Game", rollouts, idx_list, view: str):
+        p_correct = torch.zeros(len(rollouts))
+        if not idx_list:
+            return p_correct, []
+        msgs = [game.message(rollouts[i], view) for i in idx_list]
+        secrets = [rollouts[i].secret_idx for i in idx_list]
+        logit = self.logits(msgs)
+        p1 = torch.sigmoid(logit.detach()).cpu()
+        s = torch.tensor(secrets, dtype=torch.float32)
+        p_correct[idx_list] = s * p1 + (1 - s) * (1 - p1)
+        correct = ((torch.rand(len(idx_list)) < p1).float() == s).float().tolist()
+        loss = F.binary_cross_entropy_with_logits(logit, s.to(self.device))
+        self.opt.zero_grad()
+        loss.backward()
+        self.opt.step()
+        return p_correct, correct
+
+    def state_dict(self):
+        return {"w": self.w.detach(), "b": self.b.detach(), "opt": self.opt.state_dict()}
+
+    def load_state_dict(self, state):
+        with torch.no_grad():
+            self.w.copy_(state["w"])
+            self.b.copy_(state["b"])
+        self.opt.load_state_dict(state["opt"])
+
+
 @torch.no_grad()
-def evaluate(model, game: Game, covers, args, device, eav=None) -> tuple[dict, list[dict]]:
+def evaluate(model, game: Game, covers, args, device, eav=None, probes=None) -> tuple[dict, list[dict]]:
     rollouts = rollout_batch(model, game, covers, 1, args.gen_batch, device)
     ex = [r for r in rollouts if r.exact]
     stats = {"n": len(rollouts), "exact_rate": len(ex) / len(rollouts),
@@ -127,6 +182,11 @@ def evaluate(model, game: Game, covers, args, device, eav=None) -> tuple[dict, l
     sets = {"": ex, "_delivered": [r for r in rollouts if delivered(r, args)]} if args.deliver == "all" else {"": ex}
     for suffix, rs in sets.items():
         for channel in ("tokens", "text"):
+            if probes is not None:
+                p = probes[0].p_correct([game.message(r, channel) for r in rs], [r.secret_idx for r in rs]).tolist() if rs else []
+                stats[f"acc_{channel}{suffix}"] = _mean([x > 0.5 for x in p])
+                stats[f"p_correct_{channel}{suffix}"] = _mean(p)
+                continue
             p = []
             for i in range(0, len(rs), args.micro_batch):
                 chunk = rs[i : i + args.micro_batch]
@@ -136,6 +196,9 @@ def evaluate(model, game: Game, covers, args, device, eav=None) -> tuple[dict, l
             stats[f"acc_{channel}{suffix}"] = _mean([x > 0.5 for x in p])
             stats[f"p_correct_{channel}{suffix}"] = _mean(p)
         stats[f"leak{suffix}"] = (stats[f"acc_tokens{suffix}"] or 0) - (stats[f"acc_text{suffix}"] or 0)
+        if probes is not None and rs:
+            p = probes[1].p_correct([game.message(r, "text") for r in rs], [r.secret_idx for r in rs]).tolist()
+            stats[f"acc_eavesdropper{suffix}"] = _mean([x > 0.5 for x in p])
         if eav is not None:
             eav_model, _, eav_device = eav
             eav_model.eval()
@@ -194,7 +257,8 @@ def train_decoder(model, game: Game, rollouts, idx_list, view: str, args, device
     return p_correct, correct
 
 
-def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, device, eav=None) -> dict:
+def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, device, eav=None,
+               probes=None) -> dict:
     t0 = time.time()
     rollouts = rollout_batch(model, game, covers, args.group, args.gen_batch, device)
     t_gen = time.time() - t0
@@ -204,8 +268,12 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
 
     recv_idx = [i for i, r in enumerate(rollouts) if delivered(r, args)]
     ex_idx = [i for i in recv_idx if rollouts[i].exact]
-    p_correct, rec_correct = train_decoder(model, game, rollouts, recv_idx, args.channel, args, device)
-    p_eav = torch.zeros(len(rollouts))
+    p_eav, eav_correct = torch.zeros(len(rollouts)), []
+    if probes is not None:
+        p_correct, rec_correct = probes[0].fit(game, rollouts, recv_idx, args.channel)
+        p_eav, eav_correct = probes[1].fit(game, rollouts, recv_idx, "text")
+    else:
+        p_correct, rec_correct = train_decoder(model, game, rollouts, recv_idx, args.channel, args, device)
     if eav is not None:
         eav_model, eav_opt, eav_device = eav
         eav_model.train()
@@ -215,7 +283,7 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         eav_opt.step()
     # What the sender is paid for: the receiver's accuracy, less the eavesdropper's if any.
     pay = p_correct - p_eav
-    fallback = 0.0 if eav is not None else 0.5
+    fallback = 0.0 if eav is not None or probes is not None else 0.5
 
     # Sender: GRPO advantages within each (cover, secret) group, token-level loss.
     if args.reward == "exact":
@@ -269,7 +337,7 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         "reward": rewards.mean().item(),
         "similarity": _mean(r.similarity for r in rollouts),
         "receiver_acc": _mean(rec_correct),
-        "eavesdropper_acc": _mean(eav_correct) if eav is not None else None,
+        "eavesdropper_acc": _mean(eav_correct) if eav is not None or probes is not None else None,
         "p_correct_exact": _mean(p_correct[ex_idx].tolist()),
         "kl": kl_sum / n_tok if ref is not None else None,
         "entropy": (ent_sum / sum(len(rollouts[i].completion) for i in train_idx)
@@ -320,6 +388,11 @@ def main() -> None:
                          "guess the secret from the re-encoded text; the sender is paid "
                          "P(receiver correct) - P(eavesdropper correct)")
     ap.add_argument("--eavesdropper-device", default="cuda:1")
+    ap.add_argument("--decoder", choices=["lm", "bow"], default="lm",
+                    help="bow: receiver and eavesdropper are bag-of-token-IDs logistic regressions "
+                         "(emitted IDs vs re-encoded text); the sender is paid the difference")
+    ap.add_argument("--probe-lr", type=float, default=0.05)
+    ap.add_argument("--lora-rank", type=int, default=0, help="0: full fine-tuning in fp32")
     ap.add_argument("--eavesdropper-lr", type=float, default=None, help="default: --lr")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--covers-per-step", type=int, default=8, help="each used with both secrets")
@@ -377,17 +450,31 @@ def main() -> None:
                                max_new_tokens=max_new, pad_token_id=tok.pad_token_id,
                                eos_token_id=sorted(game.stops))
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(device)
+    if args.lora_rank:
+        from peft import LoraConfig, get_peft_model
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(device)
     # Assigned rather than passed: generate() replaces values left at their defaults
     # (temperature 1, top_p 1) with the model's own sampling defaults.
     model.generation_config = gen_cfg
+    if args.lora_rank:
+        model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=2 * args.lora_rank,
+                                                 target_modules="all-linear", lora_dropout=0.0))
+        for p in model.parameters():
+            if p.requires_grad:
+                p.data = p.data.float()  # fp32 adapters on a bf16 base; autocast does the matmuls
     # Never sample the embedding rows past the tokenizer (see Game.rollout).
     model.stego_logits_processor = LogitsProcessorList([MaskFrom(game.n_vocab)])
     ref = None
     if args.kl_beta > 0:
         ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device).eval()
         ref.requires_grad_(False)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr,
+                            weight_decay=0.0, betas=(0.9, 0.999))
+    probes = None
+    if args.decoder == "bow":
+        probes = (BowProbe(game.n_vocab, args.probe_lr, device), BowProbe(game.n_vocab, args.probe_lr, device))
     eav = None
     if args.eavesdropper == "separate":
         eav_device = torch.device(args.eavesdropper_device)
@@ -404,6 +491,9 @@ def main() -> None:
         state = torch.load(ckpt, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
+        if probes is not None:
+            probes[0].load_state_dict(state["probe_receiver"])
+            probes[1].load_state_dict(state["probe_eavesdropper"])
         if eav is not None:
             eav[0].load_state_dict(state["eav_model"])
             eav[1].load_state_dict(state["eav_opt"])
@@ -420,7 +510,7 @@ def main() -> None:
             (out / f).unlink(missing_ok=True)
 
     def run_eval(at: int) -> None:
-        stats, dump = evaluate(model, game, eval_covers, args, device, eav)
+        stats, dump = evaluate(model, game, eval_covers, args, device, eav, probes)
         append_jsonl(out / "eval.jsonl", {"step": at, **stats})
         with open(out / f"eval_rollouts_{at:05d}.jsonl", "w") as f:
             f.writelines(json.dumps(d) + "\n" for d in dump)
@@ -433,7 +523,7 @@ def main() -> None:
         covers_now = rng.sample(train_covers, min(args.covers_per_step, len(train_covers)))
         decay = max(0.0, 1 - step / args.ent_anneal_steps) if args.ent_anneal_steps else 1.0
         ent_coef = adaptive_coef if args.ent_target else args.ent_coef * decay
-        stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device, eav)
+        stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device, eav, probes)
         if args.ent_target:
             stats["ent_target"] = target = args.ent_target * decay
             nudge = args.ent_coef_step if stats["entropy"] < target else -args.ent_coef_step
@@ -452,6 +542,8 @@ def main() -> None:
                      "cuda_rng": torch.cuda.get_rng_state()}
             if eav is not None:
                 state |= {"eav_model": eav[0].state_dict(), "eav_opt": eav[1].state_dict()}
+            if probes is not None:
+                state |= {"probe_receiver": probes[0].state_dict(), "probe_eavesdropper": probes[1].state_dict()}
             atomic_save(state, ckpt)
     if args.save_final:
         model.to(torch.bfloat16).save_pretrained(out / "final")

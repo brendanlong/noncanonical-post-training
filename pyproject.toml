@@ -14,7 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["vllm==0.11.*"]
+gpu = [
+    "peft>=0.21.0",
+    "vllm==0.11.*",
+]
 
 [tool.uv]
 package = false
