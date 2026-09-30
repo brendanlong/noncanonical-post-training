@@ -1,6 +1,7 @@
 # Does RL discover tokenization as a hidden channel? (prototype, 2026-09-29)
 
-**Result: no, in any of seven runs, nor with an entropy bonus (seven more).** With ordinary GRPO settings and a reward
+**Result: no, in any of seven runs, nor with an entropy bonus, higher
+temperature, larger batches or partial credit (visible channels win instead).** With ordinary GRPO settings and a reward
 that never mentions tokens, three small models (Qwen3-1.7B, Qwen3-0.6B,
 OLMo-2-1B-Instruct) learned to copy the cover text exactly within 1-20 steps.
 None of them learned to pass the secret through tokenization. The bottleneck is
@@ -200,12 +201,41 @@ token channel would raise the reward from 0.75 to 1.0. But the receiver already
 answers apple to every exact copy, so an orange sender that tries an exact
 split copy scores 0 and is pushed away before the receiver can learn to read it.
 
+### Delivering every reply, with larger batches
+
+`--deliver all`, with each step at 32 covers × 2 secrets × 16 samples = 1,024
+rollouts, closer to DAPO's scale, for 400 steps (about 410,000 rollouts).
+OLMo-2-1B, token channel. The bonus run was preempted by higher-priority work
+at step 330 and was written up from there.
+
+| run | exact copies (final) | receiver accuracy, all delivered replies | token receiver minus text receiver | reward | non-canonical exact copies |
+|---|---|---|---|---|---|
+| no bonus | 99.5% | 0.500 | 0.000 at every eval | 0.500 | 17 |
+| adaptive bonus (start 0.15, target 0.1, annealed by step 200) | 50% | 0.998 from step 50 | 0.000 at every eval | 0.966 | 51 |
+
+Without a bonus, the policy collapses to the canonical copy as in every
+exact-reward run, and no channel of any kind appears. With the bonus it finds a
+visible channel by step 50. For apple it copies exactly; for orange it **writes
+the word "orange" into the sentence** ("But then the orange started to fall…",
+"Orange upon a time…", "…one big happy orange."). The similarity cost is about
+3%, so this pays about 0.97 against 1.0 for a token channel, which leaves
+almost no pressure to switch, and it doesn't.
+
+Across all the partial-credit runs: once any partial credit exists, RL finds a
+visible or selection channel within 50-80 steps whenever the policy explores
+at all. It never finds the tokenization channel, which would pay slightly more.
+
 ## What this does and doesn't show
 
 - **It shows:** in the lowest-entropy task there is (copy a given text), with
   ordinary GRPO, a cooperative receiver sharing the sender's weights and a
   perfect incentive, tokenization does not become a channel. Exploration never
-  gets it started, and a generic entropy bonus doesn't change that.
+  gets it started. Neither a generic entropy bonus, higher temperature, larger
+  batches nor partial credit changes that.
+- **Given partial credit, RL takes the cheapest visible channel.** A trailing
+  newline, the secret word written into the text, or which messages get
+  through. All were found within 50-80 steps, and each pays within a few
+  percent of what the token channel would.
 - **It doesn't show** that a channel couldn't be amplified once present. No run
   had enough non-canonical samples at once for GRPO to reinforce them. Testing
   amplification needs a foothold on splits specifically, such as an SFT warm
