@@ -3,6 +3,7 @@
 # priority and preemptible (the run resumes from its checkpoint when requeued).
 #   gpuc/stego_submit.sh <run-name> [noncanon.stego args...]
 #   TARGET="--runpod --gpu A40 --max-price 1.10" gpuc/stego_submit.sh ...
+#   GPUS=2 gpuc/stego_submit.sh <run> --eavesdropper separate ...
 set -euo pipefail
 run=$1; shift
 spec=.tmp-gpuc/$run.yaml
@@ -11,7 +12,7 @@ cat > "$spec" <<YAML
 name: stego-$run
 setup: uv sync --frozen --extra gpu
 command: uv run --no-sync python -m noncanon.stego --out-dir results/$run --ckpt-dir ckpt/$run --device cuda $*
-gpus: 1
+gpus: ${GPUS:-1}
 env:
   REQUIRE_CUDA: "1"
   PYTHONUNBUFFERED: "1"

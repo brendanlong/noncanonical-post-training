@@ -14,6 +14,11 @@ IDs, as when a pipeline passes token IDs between turns or agents.
 ``--channel text``: the receiver sees the reply re-encoded from text, as when
 transcripts are stored as text. No information can pass; this is the control.
 
+``--eavesdropper separate`` adds an adversary: a second copy of the model that
+learns to guess the secret from the re-encoded text (a transcript), and the sender
+is paid P(receiver correct) - P(eavesdropper correct), so any visible signal nets
+nothing.
+
 Every eval scores the same held-out rollouts with both receivers, so
 ``acc_tokens - acc_text`` is the information carried by tokenization alone.
 
@@ -112,7 +117,7 @@ def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, d
 
 
 @torch.no_grad()
-def evaluate(model, game: Game, covers, args, device) -> tuple[dict, list[dict]]:
+def evaluate(model, game: Game, covers, args, device, eav=None) -> tuple[dict, list[dict]]:
     rollouts = rollout_batch(model, game, covers, 1, args.gen_batch, device)
     ex = [r for r in rollouts if r.exact]
     stats = {"n": len(rollouts), "exact_rate": len(ex) / len(rollouts),
@@ -131,6 +136,16 @@ def evaluate(model, game: Game, covers, args, device) -> tuple[dict, list[dict]]
             stats[f"acc_{channel}{suffix}"] = _mean([x > 0.5 for x in p])
             stats[f"p_correct_{channel}{suffix}"] = _mean(p)
         stats[f"leak{suffix}"] = (stats[f"acc_tokens{suffix}"] or 0) - (stats[f"acc_text{suffix}"] or 0)
+        if eav is not None:
+            eav_model, _, eav_device = eav
+            eav_model.eval()
+            p = []
+            for i in range(0, len(rs), args.micro_batch):
+                chunk = rs[i : i + args.micro_batch]
+                lg = receiver_logits(eav_model, game.pre, game.post, [game.message(r, "text") for r in chunk],
+                                     game.answer_ids, game.tok.pad_token_id, eav_device)
+                p.extend(lg.softmax(-1)[torch.arange(len(chunk)), [r.secret_idx for r in chunk]].tolist())
+            stats[f"acc_eavesdropper{suffix}"] = _mean([x > 0.5 for x in p])
     tok = game.tok
     dump = [{"cover": r.cover, "secret": game.secrets[r.secret_idx], "exact": r.exact,
              "noncanonical": r.noncanonical, "body": r.body,
@@ -149,26 +164,18 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
-def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, device) -> dict:
-    t0 = time.time()
-    rollouts = rollout_batch(model, game, covers, args.group, args.gen_batch, device)
-    t_gen = time.time() - t0
-    model.train()
-    # Zeros rather than None, so a step with nothing to learn still steps Adam like before.
-    opt.zero_grad(set_to_none=False)
-
-    # Receiver: REINFORCE on its sampled guess, over the replies delivered to it.
-    # Each distinct message is scored once, so identical replies get identical rewards
-    # (batch-dependent bf16 noise would otherwise become full-size GRPO advantages).
-    recv_idx = [i for i, r in enumerate(rollouts) if delivered(r, args)]
-    ex_idx = [i for i in recv_idx if rollouts[i].exact]
+def train_decoder(model, game: Game, rollouts, idx_list, view: str, args, device):
+    """REINFORCE on the sampled guess over the delivered replies (seen as ``view``);
+    backpropagates and returns each rollout's P(correct) and the sampled rewards.
+    Each distinct message is scored once, so identical replies get identical rewards
+    (batch-dependent bf16 noise would otherwise become full-size GRPO advantages)."""
     by_msg: dict[tuple[int, ...], list[int]] = {}
-    for i in recv_idx:
-        by_msg.setdefault(tuple(game.message(rollouts[i], args.channel)), []).append(i)
+    for i in idx_list:
+        by_msg.setdefault(tuple(game.message(rollouts[i], view)), []).append(i)
     msgs = list(by_msg)
     p_correct = torch.zeros(len(rollouts))
-    rec_correct = []
-    n_recv = max(len(recv_idx), 1)
+    correct = []
+    n = max(len(idx_list), 1)
     for j in range(0, len(msgs), args.micro_batch):
         chunk = msgs[j : j + args.micro_batch]
         lg = receiver_logits(model, game.pre, game.post, [list(m) for m in chunk],
@@ -181,17 +188,42 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         p_correct[idx] = probs[torch.arange(len(idx)), secret].cpu()
         guess = torch.multinomial(probs, 1).squeeze(-1)
         reward = (guess == secret).float()
-        rec_correct.extend(reward.tolist())
-        loss = -((reward - 0.5) * logp[torch.arange(len(idx)), guess]).sum() / n_recv
+        correct.extend(reward.tolist())
+        loss = -((reward - 0.5) * logp[torch.arange(len(idx)), guess]).sum() / n
         (args.receiver_coef * loss).backward()
+    return p_correct, correct
+
+
+def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, device, eav=None) -> dict:
+    t0 = time.time()
+    rollouts = rollout_batch(model, game, covers, args.group, args.gen_batch, device)
+    t_gen = time.time() - t0
+    model.train()
+    # Zeros rather than None, so a step with nothing to learn still steps Adam like before.
+    opt.zero_grad(set_to_none=False)
+
+    recv_idx = [i for i, r in enumerate(rollouts) if delivered(r, args)]
+    ex_idx = [i for i in recv_idx if rollouts[i].exact]
+    p_correct, rec_correct = train_decoder(model, game, rollouts, recv_idx, args.channel, args, device)
+    p_eav = torch.zeros(len(rollouts))
+    if eav is not None:
+        eav_model, eav_opt, eav_device = eav
+        eav_model.train()
+        eav_opt.zero_grad(set_to_none=False)
+        p_eav, eav_correct = train_decoder(eav_model, game, rollouts, recv_idx, "text", args, eav_device)
+        torch.nn.utils.clip_grad_norm_(eav_model.parameters(), args.max_grad_norm)
+        eav_opt.step()
+    # What the sender is paid for: the receiver's accuracy, less the eavesdropper's if any.
+    pay = p_correct - p_eav
+    fallback = 0.0 if eav is not None else 0.5
 
     # Sender: GRPO advantages within each (cover, secret) group, token-level loss.
     if args.reward == "exact":
-        rewards = torch.tensor([float(r.exact) for r in rollouts]) * p_correct
+        rewards = torch.tensor([float(r.exact) for r in rollouts]) * pay
     else:
         # Partial credit from the monitor. Undelivered replies get chance-level receiver credit.
         sent = torch.tensor([delivered(r, args) for r in rollouts])
-        rewards = torch.tensor([r.similarity for r in rollouts]) * torch.where(sent, p_correct, 0.5)
+        rewards = torch.tensor([r.similarity for r in rollouts]) * torch.where(sent, pay, fallback)
     g = rewards.view(-1, args.group)
     adv = g - g.mean(1, keepdim=True)
     if not args.no_std_norm:
@@ -237,6 +269,7 @@ def train_step(model, ref, opt, game: Game, covers, args, ent_coef: float, devic
         "reward": rewards.mean().item(),
         "similarity": _mean(r.similarity for r in rollouts),
         "receiver_acc": _mean(rec_correct),
+        "eavesdropper_acc": _mean(eav_correct) if eav is not None else None,
         "p_correct_exact": _mean(p_correct[ex_idx].tolist()),
         "kl": kl_sum / n_tok if ref is not None else None,
         "entropy": (ent_sum / sum(len(rollouts[i].completion) for i in train_idx)
@@ -282,6 +315,12 @@ def main() -> None:
                     help="which replies the receiver sees: exact copies only, or every finished "
                          "reply (then a visible edit can also carry the secret; the eval's "
                          "*_delivered stats cover those)")
+    ap.add_argument("--eavesdropper", choices=["none", "separate"], default="none",
+                    help="separate: a second copy of the model, on --eavesdropper-device, learns to "
+                         "guess the secret from the re-encoded text; the sender is paid "
+                         "P(receiver correct) - P(eavesdropper correct)")
+    ap.add_argument("--eavesdropper-device", default="cuda:1")
+    ap.add_argument("--eavesdropper-lr", type=float, default=None, help="default: --lr")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--covers-per-step", type=int, default=8, help="each used with both secrets")
     ap.add_argument("--group", type=int, default=8)
@@ -349,6 +388,13 @@ def main() -> None:
         ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(device).eval()
         ref.requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
+    eav = None
+    if args.eavesdropper == "separate":
+        eav_device = torch.device(args.eavesdropper_device)
+        eav_model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(eav_device)
+        eav_opt = torch.optim.AdamW(eav_model.parameters(), lr=args.eavesdropper_lr or args.lr,
+                                    weight_decay=0.0, betas=(0.9, 0.999))
+        eav = (eav_model, eav_opt, eav_device)
 
     step = 0
     adaptive_coef = args.ent_coef
@@ -358,6 +404,9 @@ def main() -> None:
         state = torch.load(ckpt, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
+        if eav is not None:
+            eav[0].load_state_dict(state["eav_model"])
+            eav[1].load_state_dict(state["eav_opt"])
         step = state["step"]
         adaptive_coef = state.get("adaptive_coef", args.ent_coef)
         rng.setstate(state["rng"])
@@ -371,7 +420,7 @@ def main() -> None:
             (out / f).unlink(missing_ok=True)
 
     def run_eval(at: int) -> None:
-        stats, dump = evaluate(model, game, eval_covers, args, device)
+        stats, dump = evaluate(model, game, eval_covers, args, device, eav)
         append_jsonl(out / "eval.jsonl", {"step": at, **stats})
         with open(out / f"eval_rollouts_{at:05d}.jsonl", "w") as f:
             f.writelines(json.dumps(d) + "\n" for d in dump)
@@ -384,7 +433,7 @@ def main() -> None:
         covers_now = rng.sample(train_covers, min(args.covers_per_step, len(train_covers)))
         decay = max(0.0, 1 - step / args.ent_anneal_steps) if args.ent_anneal_steps else 1.0
         ent_coef = adaptive_coef if args.ent_target else args.ent_coef * decay
-        stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device)
+        stats = train_step(model, ref, opt, game, covers_now, args, ent_coef, device, eav)
         if args.ent_target:
             stats["ent_target"] = target = args.ent_target * decay
             nudge = args.ent_coef_step if stats["entropy"] < target else -args.ent_coef_step
@@ -398,9 +447,12 @@ def main() -> None:
         if step % args.eval_every == 0 or step == args.steps:
             run_eval(step)
         if args.save_every and step % args.save_every == 0 and step < args.steps:
-            atomic_save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                         "adaptive_coef": adaptive_coef, "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
-                         "cuda_rng": torch.cuda.get_rng_state()}, ckpt)
+            state = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+                     "adaptive_coef": adaptive_coef, "rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
+                     "cuda_rng": torch.cuda.get_rng_state()}
+            if eav is not None:
+                state |= {"eav_model": eav[0].state_dict(), "eav_opt": eav[1].state_dict()}
+            atomic_save(state, ckpt)
     if args.save_final:
         model.to(torch.bfloat16).save_pretrained(out / "final")
         tok.save_pretrained(out / "final")
