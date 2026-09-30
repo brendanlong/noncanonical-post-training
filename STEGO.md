@@ -225,6 +225,91 @@ Across all the partial-credit runs: once any partial credit exists, RL finds a
 visible or selection channel within 50-80 steps whenever the policy explores
 at all. It never finds the tokenization channel, which would pay slightly more.
 
+## Adversarial eavesdropper (local prototype)
+
+An eavesdropper reads the re-encoded transcript, and the sender is paid for
+what the token-level receiver gets that the eavesdropper doesn't:
+
+    reward = similarity × (P(receiver correct) − P(eavesdropper correct))
+
+Optionally, `--monitor-weight w` makes it P(receiver correct) −
+P(eavesdropper correct) + w × similarity. Every reply is delivered. Any visible
+signal (a trailing newline, the secret word, which replies get through) is
+readable from the transcript too, so it nets nothing. Only information the
+transcript loses can pay.
+
+Prototype on the local 8 GB card:
+- **Sender:** Qwen3-0.6B, LoRA rank 16, lr 2e-5, Dr. GRPO (`--no-std-norm`),
+  128 rollouts per step.
+- **Receiver and eavesdropper:** two identical logistic-regression probes,
+  starting from zero weights and trained on the same replies with the same
+  learning rate. The receiver sees the emitted IDs and the eavesdropper the
+  re-encoded text.
+    - `--decoder bow`: features are which token IDs a message contains.
+    - `--decoder act`: features are a frozen copy of the base model's
+      activations, averaged over the message.
+
+Whenever the emitted IDs are canonical, both probes see identical inputs and
+get identical updates. So the reward is exactly 0 until a non-canonical token
+appears, and there is no pressure on the text at all. The sender keeps its
+natural randomness: 35% exact at the start, with no sharpening.
+
+| decoder | extra | where the sender ended up | token-channel leak |
+|---|---|---|---|
+| bow | seed 0 | junk text with a split code by step 150 | **0.41-0.47** |
+| bow | seed 1 | "Secret word is 'orange'? …" with a split code by step 400 | **0.43** |
+| bow | seed 2 | exact canonical copy by step 50 | 0 |
+| bow | monitor weight 0.1 | exact canonical copy by step 50 | 0 |
+| bow | monitor weight 0.01 | exact canonical copy by step 50 | 0 |
+| act, middle layer | | 74% non-canonical by step 100, then the exact copy by step 150 | about 0 |
+| act, layer 2 | | writes the secret word ("apple" / "orange") by step 50 | 0 |
+| act, layer 2 | monitor weight 0.01 | exact canonical copy by step 50 | 0 |
+
+"Leak" is the same receiver probe's accuracy on the emitted IDs minus its
+accuracy on the re-encoded text, over all delivered replies in the eval.
+
+**The two codes RL found (bag-of-IDs receiver):**
+
+| run | secret | emitted | re-encoded transcript |
+|---|---|---|---|
+| seed 0 | apple (181 of 200) | `no` `quotes` **`orang` `ep`** … | `or` `angep` |
+| seed 0 | orange | `no` **`or` `angep`** … (canonical) | same |
+| seed 1 | orange (197 of 200) | `'orange` **`'` `?`** … | `'?` |
+| seed 1 | apple | `'?` (canonical) | same |
+
+In seed 0 the receiver probe was 96-98% right on the emitted IDs and 51-55% on
+the transcript. In seed 1 it was 93% against 50%, and the eavesdropper was at
+37%: its weights still tracked an earlier visible code, which is the
+cat-and-mouse that keeps exploration going. Both codes also carry some visible
+difference ("quotes" in seed 0; "'apple' or 'orange'" vs "'orange'" in seed 1)
+that the eavesdropper had partly caught up with.
+
+**What made it work, and what didn't:**
+- **No pressure on the text is necessary.** Any anchor on similarity, even
+  0.01, collapses the sender onto the canonical copy within 50 steps, the same
+  as every exact-copy run above. The channel only appears when the sender is
+  free to drift.
+- **The drift comes from Adam, not the reward.** With identical probes the
+  rewards are about ±0.001, and Adam rescales those gradients to full-size
+  steps. With GRPO's standard-deviation normalization it was worse: a random
+  walk to junk text by step 150, and no channel.
+- **A reader built on a language model doesn't pick up splits easily.** With
+  activation features, the sender produced plenty of non-canonical tokens, but
+  the probe on mean middle-layer activations couldn't separate them. The
+  eavesdropper, reading clean canonical text, did slightly better, so splits
+  were slightly punished. That fits language models' internal representations
+  being largely insensitive to how a word was split.
+- **Dead ends are absorbing.** Writing the secret word, or an exact canonical
+  copy, gives both probes the same view and a reward of exactly 0. Nothing
+  pushes the sender back out.
+
+So the adversarial setup can produce a real tokenization channel from ordinary
+RL, but so far only with a receiver that reads token IDs directly and with no
+constraint on the text, in 2 of 3 seeds. Whether it happens with an LM reading
+the message is the open question. The two OLMo-2-1B runs with a full LM
+receiver and eavesdropper (`--eavesdropper separate`, both SPAR cards) are
+still queued.
+
 ## What this does and doesn't show
 
 - **It shows:** in the lowest-entropy task there is (copy a given text), with
