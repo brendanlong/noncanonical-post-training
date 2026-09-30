@@ -14,11 +14,12 @@ IDs, as when a pipeline passes token IDs between turns or agents.
 ``--channel text``: the receiver sees the reply re-encoded from text, as when
 transcripts are stored as text. No information can pass; this is the control.
 
-``--decoder bow`` replaces both with two cheap probes (logistic regression on
-which token IDs a message contains): a receiver on the emitted IDs and an
-eavesdropper on the re-encoded text, trained identically, with the sender paid
-the difference. Visible signals then net exactly nothing, because whenever the
-emitted IDs are canonical the two probes see the same input.
+``--decoder bow`` / ``act`` replace both with two cheap probes (logistic regression
+on which token IDs a message contains, or on a frozen copy of the base model's
+activations over it): a receiver on the emitted IDs and an eavesdropper on the
+re-encoded text, trained identically, with the sender paid the difference.
+Visible signals then net exactly nothing, because whenever the emitted IDs are
+canonical the two probes see the same input.
 
 ``--eavesdropper separate`` adds an adversary: a second copy of the model that
 learns to guess the secret from the re-encoded text (a transcript), and the sender
@@ -122,22 +123,13 @@ def rollout_batch(model, game: Game, covers: list[str], group: int, gen_batch, d
             for (c, s), p, x in zip(specs, prompts, comps)]
 
 
-class BowProbe:
-    """Logistic regression on which token IDs a message contains: a cheap receiver
-    or eavesdropper. Scores before each update, like the LM decoders."""
-
-    def __init__(self, n_vocab: int, lr: float, device):
-        self.w = torch.zeros(n_vocab, 1, device=device, requires_grad=True)
-        self.b = torch.zeros((), device=device, requires_grad=True)
-        self.opt = torch.optim.Adam([self.w, self.b], lr=lr)
-        self.device = device
+class Probe:
+    """A cheap receiver or eavesdropper: logistic regression on features of a message,
+    scored before each update like the LM decoders. Subclasses define ``logits``."""
 
     def logits(self, msgs: list[list[int]]) -> torch.Tensor:
         """Logit of the second secret, per message."""
-        ids = [sorted(set(m)) or [0] for m in msgs]
-        flat = torch.tensor([t for i in ids for t in i], device=self.device)
-        offsets = torch.tensor([0] + [len(i) for i in ids[:-1]], device=self.device).cumsum(0)
-        return F.embedding_bag(flat, self.w, offsets, mode="sum").squeeze(-1) + self.b
+        raise NotImplementedError
 
     def p_correct(self, msgs, secrets: list[int]) -> torch.Tensor:
         p1 = torch.sigmoid(self.logits(msgs)).detach().cpu()
@@ -149,13 +141,12 @@ class BowProbe:
         if not idx_list:
             return p_correct, []
         msgs = [game.message(rollouts[i], view) for i in idx_list]
-        secrets = [rollouts[i].secret_idx for i in idx_list]
+        s = torch.tensor([rollouts[i].secret_idx for i in idx_list], dtype=torch.float32)
         logit = self.logits(msgs)
         p1 = torch.sigmoid(logit.detach()).cpu()
-        s = torch.tensor(secrets, dtype=torch.float32)
         p_correct[idx_list] = s * p1 + (1 - s) * (1 - p1)
         correct = ((torch.rand(len(idx_list)) < p1).float() == s).float().tolist()
-        loss = F.binary_cross_entropy_with_logits(logit, s.to(self.device))
+        loss = F.binary_cross_entropy_with_logits(logit, s.to(logit.device))
         self.opt.zero_grad()
         loss.backward()
         self.opt.step()
@@ -169,6 +160,66 @@ class BowProbe:
             self.w.copy_(state["w"])
             self.b.copy_(state["b"])
         self.opt.load_state_dict(state["opt"])
+
+
+class BowProbe(Probe):
+    """Which token IDs the message contains."""
+
+    def __init__(self, n_vocab: int, lr: float, device):
+        self.w = torch.zeros(n_vocab, 1, device=device, requires_grad=True)
+        self.b = torch.zeros((), device=device, requires_grad=True)
+        self.opt = torch.optim.Adam([self.w, self.b], lr=lr)
+        self.device = device
+
+    def logits(self, msgs):
+        ids = [sorted(set(m)) or [0] for m in msgs]
+        flat = torch.tensor([t for i in ids for t in i], device=self.device)
+        offsets = torch.tensor([0] + [len(i) for i in ids[:-1]], device=self.device).cumsum(0)
+        return F.embedding_bag(flat, self.w, offsets, mode="sum").squeeze(-1) + self.b
+
+
+class Reader:
+    """A frozen copy of the base model reading a message in the receiver's prompt;
+    features are its hidden state at ``layer``, averaged over the message tokens."""
+
+    def __init__(self, model_name: str, game: "Game", layer: int, batch: int, device):
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to(device).eval()
+        self.model.requires_grad_(False)
+        self.game, self.layer, self.batch, self.device = game, layer, batch, device
+        self.dim = self.model.config.hidden_size
+        self.cache: dict[tuple[int, ...], torch.Tensor] = {}
+
+    @torch.no_grad()
+    def __call__(self, msgs: list[list[int]]) -> torch.Tensor:
+        if len(self.cache) > 200_000:
+            self.cache.clear()
+        todo = list({tuple(m) for m in msgs if tuple(m) not in self.cache})
+        pre, post = self.game.pre, self.game.post
+        for i in range(0, len(todo), self.batch):
+            chunk = todo[i : i + self.batch]
+            ids, mask = left_pad([pre + list(m) + post for m in chunk], self.game.tok.pad_token_id, self.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+                h = self.model(input_ids=ids, attention_mask=mask, position_ids=positions(mask),
+                               output_hidden_states=True).hidden_states[self.layer].float()
+            n = ids.shape[1]
+            for k, m in enumerate(chunk):
+                end = n - len(post)
+                v = h[k, end - len(m) : end].mean(0) if m else h[k, end - 1]
+                self.cache[m] = v / v.norm() * self.dim ** 0.5
+        return torch.stack([self.cache[tuple(m)] for m in msgs])
+
+
+class ActProbe(Probe):
+    """Logistic regression on a frozen reader's activations over the message."""
+
+    def __init__(self, reader: Reader, lr: float):
+        self.reader = reader
+        self.w = torch.zeros(reader.dim, device=reader.device, requires_grad=True)
+        self.b = torch.zeros((), device=reader.device, requires_grad=True)
+        self.opt = torch.optim.Adam([self.w, self.b], lr=lr)
+
+    def logits(self, msgs):
+        return self.reader(msgs) @ self.w + self.b
 
 
 @torch.no_grad()
@@ -388,10 +439,13 @@ def main() -> None:
                          "guess the secret from the re-encoded text; the sender is paid "
                          "P(receiver correct) - P(eavesdropper correct)")
     ap.add_argument("--eavesdropper-device", default="cuda:1")
-    ap.add_argument("--decoder", choices=["lm", "bow"], default="lm",
-                    help="bow: receiver and eavesdropper are bag-of-token-IDs logistic regressions "
-                         "(emitted IDs vs re-encoded text); the sender is paid the difference")
-    ap.add_argument("--probe-lr", type=float, default=0.05)
+    ap.add_argument("--decoder", choices=["lm", "bow", "act"], default="lm",
+                    help="bow / act: receiver and eavesdropper are logistic-regression probes, on "
+                         "which token IDs a message contains (bow) or on a frozen copy of the base "
+                         "model's activations over it (act), one fed the emitted IDs and one the "
+                         "re-encoded text; the sender is paid the difference")
+    ap.add_argument("--probe-lr", type=float, default=None, help="default: 0.05 (bow), 1e-3 (act)")
+    ap.add_argument("--probe-layer", type=int, default=None, help="reader layer for act; default: middle")
     ap.add_argument("--lora-rank", type=int, default=0, help="0: full fine-tuning in fp32")
     ap.add_argument("--eavesdropper-lr", type=float, default=None, help="default: --lr")
     ap.add_argument("--steps", type=int, default=1000)
@@ -474,7 +528,14 @@ def main() -> None:
                             weight_decay=0.0, betas=(0.9, 0.999))
     probes = None
     if args.decoder == "bow":
-        probes = (BowProbe(game.n_vocab, args.probe_lr, device), BowProbe(game.n_vocab, args.probe_lr, device))
+        lr = args.probe_lr or 0.05
+        probes = (BowProbe(game.n_vocab, lr, device), BowProbe(game.n_vocab, lr, device))
+    elif args.decoder == "act":
+        reader = Reader(args.model, game, args.probe_layer, args.micro_batch, device)
+        if args.probe_layer is None:
+            reader.layer = reader.model.config.num_hidden_layers // 2
+        lr = args.probe_lr or 1e-3
+        probes = (ActProbe(reader, lr), ActProbe(reader, lr))
     eav = None
     if args.eavesdropper == "separate":
         eav_device = torch.device(args.eavesdropper_device)
